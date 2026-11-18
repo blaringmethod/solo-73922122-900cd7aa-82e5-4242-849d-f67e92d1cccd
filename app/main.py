@@ -13,6 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import config, db, worker
+from .review import ReviewError, ReviewSpec, SiteSpec, AlignmentSpec, run_review
+from .schemas import ReviewRequest, ReviewResponse
 from .worker import UploadTooLarge, start_worker, task_dir
 
 
@@ -232,3 +234,39 @@ def download_r2(task_id: str) -> FileResponse:
 @app.get("/health")
 def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@app.post(
+    "/tasks/{task_id}/reviews",
+    response_model=ReviewResponse,
+    summary="候选 SNV 双端读段证据复核",
+)
+def create_review(task_id: str, payload: ReviewRequest) -> ReviewResponse:
+    """按比对表从成功任务的双端结果中提取位点证据。
+
+    整次语义：重复或未知读号、非法比对、结果缺件或 FASTQ 后段损坏都会
+    让整次请求失败（4xx），不返回任何部分统计，也不改动结果文件。
+    """
+    spec = ReviewSpec(
+        task_id=task_id,
+        min_quality=payload.min_quality,
+        sites=tuple(
+            SiteSpec(position=site.position, ref=site.ref, alt=site.alt)
+            for site in payload.sites
+        ),
+        alignments=tuple(
+            AlignmentSpec(
+                read_id=item.read_id,
+                end=item.end,
+                ref_start=item.ref_start,
+                strand=item.strand,
+                cigar=item.cigar,
+            )
+            for item in payload.alignments
+        ),
+    )
+    try:
+        result = run_review(spec)
+    except ReviewError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    return ReviewResponse(**result)

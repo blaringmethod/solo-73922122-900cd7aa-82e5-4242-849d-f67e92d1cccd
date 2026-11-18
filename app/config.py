@@ -41,3 +41,16 @@ STAGE_PARSE = "parse"
 STAGE_VALIDATE = "validate"
 STAGE_PUBLISH = "publish"
 STAGE_DONE = "done"
+
+# --- SNV 复核（/tasks/{id}/reviews）硬性上限 ---
+REVIEW_MAX_SITES = int(os.environ.get("FASTQ_REVIEW_MAX_SITES", 8))
+"""单次复核至多 8 个参考位点。"""
+
+REVIEW_MAX_PAIRS = int(os.environ.get("FASTQ_REVIEW_MAX_PAIRS", 2000))
+"""比对表至多引用 2000 个互异读号（即 2000 对读段）。"""
+
+REVIEW_MAX_READ_LENGTH = int(os.environ.get("FASTQ_REVIEW_MAX_READ_LENGTH", 500))
+"""被引用读段每端不超过 500 碱基。"""
+
+REVIEW_MAX_ALIGNMENTS = REVIEW_MAX_PAIRS * 2
+"""每个读号至多两条（R1/R2）比对，比对表条目上限随之确定。"""

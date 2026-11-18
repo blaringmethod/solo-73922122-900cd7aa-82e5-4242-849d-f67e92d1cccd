@@ -55,10 +55,78 @@
 | POST | `/tasks/{id}/cancel` | 请求取消（立即返回） |
 | GET  | `/tasks/{id}/download/r1` | 下载配对后的 R1 |
 | GET  | `/tasks/{id}/download/r2` | 下载配对后的 R2 |
+| POST | `/tasks/{id}/reviews` | 候选 SNV 双端读段证据复核（见下节） |
 | GET  | `/health` | 健康检查 |
 
 启动后打开交互式文档：<http://localhost:8000/docs>，可直接在页面上演示
-上传、取消、下载全流程。
+上传、取消、下载全流程；复核接口的请求体 schema 与示例同样可在 `/docs`
+中直接调用。
+
+## SNV 复核接口 `POST /tasks/{id}/reviews`
+
+变异复核员据此判断候选 SNV 是否有可信的双端读段支持。仅接受
+**已成功（succeeded）** 的任务号；请求体包含：
+
+- `min_quality`：Phred+33 最低质量值，整数 0～40；
+- `sites`：1～8 个位点，每个含从 1 开始的参考坐标 `position`、互异的
+  ACGT `ref` 与 `alt`，位点坐标必须互异；
+- `alignments`：比对表，每条含 `read_id`（读号）、`end`（端别 1/2）、
+  `ref_start`（1 开始的参考起点）、`strand`（`forward`/`reverse`）、
+  `cigar`（仅 M/I/D/S，S 只允许在首尾，至少含一个 M）。
+
+处理上限（超出整次 422，不处理）：
+
+- 比对表至多引用 **2000 个互异读号**（即 2000 对读段），同一
+  `(read_id, end)` 不得重复；
+- 被引用读段**每端不超过 500 碱基**（CIGAR 读消耗必须与读长一致）。
+
+证据提取与计数规则：
+
+- 按比对位置在两端结果 FASTQ 上取证据；`reverse` 链先对序列**反向互补**、
+  对质量串**整体反转**，再按 CIGAR 同步取碱基；
+- CIGAR 语义：M 同时推进读与参考、I 仅推进读、D 仅推进参考、S 仅推进读
+  且不覆盖任何参考位点；
+- 只有**覆盖目标位点且质量达标**的碱基才计入；质量不达标或未覆盖视为
+  该端无证据；
+- 同一对读段在每个位点至多贡献一次：两端都有效且碱基一致只计一次，
+  两端都有效却相异计一次**冲突**（不选一端、不重复计数），仅一端有效按
+  该端碱基分类，两端均无有效证据计入 `no_evidence_count`；
+- 碱基分类：等于 REF 计 `ref_count`，等于 ALT 计 `alt_count`，其余有效
+  碱基（含 N、小写归一后仍非 REF/ALT 的碱基）计 `other_count`。
+
+响应逐位点返回五个桶的读对数，五者之和恒等于 `pairs_total`：
+
+```json
+{
+  "task_id": "...",
+  "pairs_total": 2,
+  "min_quality": 20,
+  "sites": [{
+    "position": 1, "ref": "A", "alt": "T",
+    "ref_count": 0, "alt_count": 1, "other_count": 0,
+    "conflict_count": 1, "no_evidence_count": 0
+  }]
+}
+```
+
+### 整次失败，不给部分统计、不改原文件
+
+下列情况整次请求报错，响应中不含任何位点统计；结果 FASTQ 始终以只读
+方式打开，复核前后逐字节不变：
+
+- 任务不存在 → 404；任务未成功 → 409；结果文件缺件 → 404；
+- 未知读号、重复 `(read_id, end)`、非法 CIGAR、CIGAR 与读长不符、
+  引用读段超过 500 碱基、比对表超过 2000 个互异读号 → 400/422；
+- 结果 FASTQ 结构损坏（含**后段截断**）、质量字节超出 Phred+33
+  （ASCII 33～126）范围 → 400。引擎会完整流式扫描两份结果文件后才出
+  统计，因此后段损坏同样能被捕获。
+
+### 复核的内存边界
+
+- 扫描逐记录流式进行，内存里只保留被引用读号（≤2000）的序列/质量与
+  位点级计数（≤8 位点），不加载整份 FASTQ；
+- 自测以打满上限的 2000 对 × 每端 500 碱基（双端各 4000 条比对、8 位点）
+  实测子进程峰值 RSS 约 21 MiB，远低于 256 MiB 上限。
 
 ## 运行（Docker Compose，内存上限 256 MiB）
 
@@ -93,27 +161,34 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
 ## 自测
 
 ```bash
-# 短测试（功能/取消/重启语义 + 取消与完成的仲裁），共 39 项检查
+# 短测试（功能/取消/重启语义 + SNV 复核 + 取消与完成的仲裁）
 bash scripts/run_tests.sh
 # 或分别运行
 .venv/bin/python -I tests/test_api.py          # 30 项：配对、整次失败、取消、重启恢复
+.venv/bin/python -I tests/test_review.py       # 42 项：SNV 复核证据规则与整次失败
 .venv/bin/python -I tests/test_cancel_race.py  # 9 项：取消/完成条件 UPDATE 仲裁
 
-# 内存压力测试：两份各 196.5 MiB（合计约 393 MiB，超过 256 MiB 内存上限），
-# 子进程实测峰值 RSS 约 19 MiB，并逐条校验配对顺序与原文
+# 内存压力测试（一）：配对路径，两份各 196.5 MiB（合计约 393 MiB，超过
+# 256 MiB 内存上限），子进程实测峰值 RSS 约 19 MiB，并逐条校验配对顺序
 .venv/bin/python -I tests/test_memory.py 2000000
+
+# 内存压力测试（二）：复核路径，2000 对 × 每端 500 碱基的上限输入，
+# 4000 条比对 + 8 位点，子进程实测峰值 RSS 约 21 MiB，逐位点核对计数总和
+.venv/bin/python -I tests/test_review_memory.py
 ```
 
 ## 目录结构
 
 ```
 app/
-  config.py    # 上限、路径、批大小等配置（环境变量可覆盖）
+  config.py    # 上限、路径、批大小等配置（环境变量可覆盖，含复核上限）
   db.py        # SQLite schema 与任务/记录访问
   fastq.py     # 流式解析、校验、JOIN 配对发布
   worker.py    # 后台线程、取消仲裁、启动恢复、任务目录清理
-  main.py      # FastAPI 路由与有界流式上传
-tests/         # 功能自测与内存压力测试
+  schemas.py   # 复核接口的 Pydantic 请求/响应模型与结构性校验
+  review.py    # 复核引擎：CIGAR 取证据、反向互补、逐位点读对计数
+  main.py      # FastAPI 路由（上传/状态/取消/下载/复核）与有界流式上传
+tests/         # 功能自测与内存压力测试（含复核专项）
 scripts/demo.sh
 Dockerfile, docker-compose.yml, requirements.txt
 ```

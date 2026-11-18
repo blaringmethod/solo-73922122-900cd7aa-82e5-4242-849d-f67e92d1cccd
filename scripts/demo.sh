@@ -69,6 +69,26 @@ assert ids[0] == ids[1] == ["alpha", "beta", "gamma", "delta", "epsilon"]
 print("OK: paired in R1 order")
 PY
 
+echo "== SNV review: per-site paired-read evidence =="
+# R1 reads are ACGTACGTAC (forward); R2 are TGCATGCATG, reviewed on the
+# reverse strand so their reverse complement matches the R1 alphabet.
+curl -fsS -X POST "$BASE_URL/tasks/$ID/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "min_quality": 20,
+    "sites": [
+      {"position": 1, "ref": "A", "alt": "T"},
+      {"position": 2, "ref": "C", "alt": "G"}
+    ],
+    "alignments": [
+      {"read_id": "alpha", "end": 1, "ref_start": 1, "strand": "forward", "cigar": "10M"},
+      {"read_id": "beta",  "end": 1, "ref_start": 1, "strand": "forward", "cigar": "10M"},
+      {"read_id": "alpha", "end": 2, "ref_start": 1, "strand": "reverse", "cigar": "10M"},
+      {"read_id": "beta",  "end": 2, "ref_start": 1, "strand": "reverse", "cigar": "10M"}
+    ]
+  }'
+echo
+
 echo "== malformed input is rejected as a whole task =="
 printf '@x\nACGT\n+\n~~\n' > "$WORK/bad_R2.fastq"     # seq 4 != qual 2
 BAD=$(curl -fsS -X POST "$BASE_URL/tasks" \
